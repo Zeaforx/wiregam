@@ -14,7 +14,11 @@ For the AWS region you select, WireGam:
 - launches a `t3.micro` EC2 instance tagged `Name=wiregam` and `Project=wiregam-instance`;
 - attaches the existing instance profile named `wiregam-ec2-ssm-role`;
 - waits for the instance and its SSM agent; and
-- runs a basic SSM shell command as a connectivity check.
+- runs the embedded deployment scripts through SSM, starting with WireGuard installation.
+
+The deployment scripts are embedded in the CLI under `internal/scripts/`. They
+run in the order listed by `scripts.Deployment()`; WireGam waits for each script
+to succeed before starting the next one.
 
 The current implementation does not choose a VPC or subnet. AWS therefore uses the default VPC/networking for the selected region. A region or account without a default VPC may fail to deploy.
 

@@ -2,10 +2,12 @@ package aws
 
 import (
 	"context"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"log"
 	"net"
+	"strings"
 	"time"
 
 	"github.com/AlecAivazis/survey/v2"
@@ -17,6 +19,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/ssm"
 	ssmtypes "github.com/aws/aws-sdk-go-v2/service/ssm/types"
 	"github.com/aws/smithy-go"
+	"github.com/zeaforx/wiregam/internal/scripts"
 )
 
 type Deployer struct{}
@@ -100,8 +103,8 @@ func (Deployer) Deploy(ctx context.Context) error {
 		return err
 	}
 
-	// 6. Send test command.
-	if err := SSMCmd(ctx, cfg, instanceID); err != nil {
+	// 6. Configure the instance using the ordered deployment scripts.
+	if err := RunDeploymentScripts(ctx, cfg, instanceID, scripts.Deployment()); err != nil {
 		return err
 	}
 
@@ -410,68 +413,140 @@ func WaitForSSM(
 	)
 }
 
-func SSMCmd(
+func RunDeploymentScripts(
 	ctx context.Context,
 	cfg aws.Config,
 	instanceID string,
+	deploymentScripts []scripts.Script,
 ) error {
-
 	client := ssm.NewFromConfig(cfg)
 
-	fmt.Printf(
-		"Sending SSM command to %s...\n",
-		instanceID,
-	)
+	for _, script := range deploymentScripts {
+		if strings.TrimSpace(script.Name) == "" {
+			return errors.New("deployment script has an empty name")
+		}
 
-	commandToRun :=
-		"echo 'Hello from Go SDK' && " +
-			"uptime && " +
-			"mkdir -p whats-oop-doug && " +
-			"touch nanya-bizzzzz"
+		if strings.TrimSpace(script.Contents) == "" {
+			return fmt.Errorf("deployment script %q is empty", script.Name)
+		}
+
+		if err := runSSMScript(ctx, client, instanceID, script); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+func runSSMScript(
+	ctx context.Context,
+	client *ssm.Client,
+	instanceID string,
+	script scripts.Script,
+) error {
+	fmt.Printf("Running %s on %s through SSM...\n", script.Name, instanceID)
 
 	output, err := client.SendCommand(
 		ctx,
 		&ssm.SendCommandInput{
-			DocumentName: aws.String(
-				"AWS-RunShellScript",
-			),
+			DocumentName: aws.String("AWS-RunShellScript"),
 			InstanceIds: []string{
 				instanceID,
 			},
 			Parameters: map[string][]string{
 				"commands": {
-					commandToRun,
+					encodeShellScript(script.Contents),
 				},
 			},
-			Comment: aws.String(
-				"WireGam deployment command",
-			),
+			Comment: aws.String("WireGam: " + script.Name),
 		},
 	)
 
 	if err != nil {
-		return fmt.Errorf(
-			"failed to send SSM command: %w",
-			err,
-		)
+		return fmt.Errorf("send %s through SSM: %w", script.Name, err)
 	}
 
 	if output.Command == nil {
+		return fmt.Errorf("SSM returned no command information for %s", script.Name)
+	}
+
+	commandID := aws.ToString(output.Command.CommandId)
+	if commandID == "" {
+		return fmt.Errorf("SSM returned an empty command ID for %s", script.Name)
+	}
+
+	invocation, err := waitForCommand(ctx, client, commandID, instanceID)
+	if err != nil {
+		return fmt.Errorf("wait for %s: %w", script.Name, err)
+	}
+
+	stdout := strings.TrimSpace(aws.ToString(invocation.StandardOutputContent))
+	stderr := strings.TrimSpace(aws.ToString(invocation.StandardErrorContent))
+	status := invocation.Status
+
+	if status != ssmtypes.CommandInvocationStatusSuccess {
 		return fmt.Errorf(
-			"SSM returned no command information",
+			"script %s failed with SSM status %s\nstdout:\n%s\nstderr:\n%s",
+			script.Name,
+			status,
+			stdout,
+			stderr,
 		)
 	}
 
-	commandID := aws.ToString(
-		output.Command.CommandId,
-	)
-
-	fmt.Printf(
-		"Command successfully sent! Command ID: %s\n",
-		commandID,
-	)
+	fmt.Printf("Completed %s.\n", script.Name)
+	if stdout != "" {
+		fmt.Printf("%s\n", stdout)
+	}
 
 	return nil
+}
+
+func encodeShellScript(contents string) string {
+	encoded := base64.StdEncoding.EncodeToString([]byte(contents))
+	return "printf '%s' '" + encoded + "' | base64 --decode | /usr/bin/env bash"
+}
+
+func waitForCommand(
+	ctx context.Context,
+	client *ssm.Client,
+	commandID string,
+	instanceID string,
+) (*ssm.GetCommandInvocationOutput, error) {
+	const maxAttempts = 60
+
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		output, err := client.GetCommandInvocation(
+			ctx,
+			&ssm.GetCommandInvocationInput{
+				CommandId:  aws.String(commandID),
+				InstanceId: aws.String(instanceID),
+			},
+		)
+		if err == nil {
+			switch output.Status {
+			case ssmtypes.CommandInvocationStatusPending,
+				ssmtypes.CommandInvocationStatusInProgress,
+				ssmtypes.CommandInvocationStatusDelayed:
+				// Keep polling until the command reaches a terminal status.
+			default:
+				return output, nil
+			}
+		} else {
+			var apiErr smithy.APIError
+			if !errors.As(err, &apiErr) || apiErr.ErrorCode() != "InvocationDoesNotExist" {
+				return nil, err
+			}
+		}
+
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(2 * time.Second):
+		}
+	}
+
+	return nil, fmt.Errorf("command %s did not finish within two minutes", commandID)
 }
 
 func CreateSecurityGroup(

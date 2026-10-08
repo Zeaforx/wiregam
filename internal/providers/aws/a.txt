@@ -1,0 +1,132 @@
+package aws
+
+import (
+	"context"
+	"fmt"
+
+	"github.com/AlecAivazis/survey/v2"
+	"github.com/aws/aws-sdk-go-v2/aws"
+	awsconfig "github.com/aws/aws-sdk-go-v2/config"
+	"github.com/aws/aws-sdk-go-v2/service/ec2"
+	"github.com/aws/aws-sdk-go-v2/service/ec2/types"
+	"github.com/aws/aws-sdk-go-v2/service/ssm"
+)
+
+type Deployer struct{}
+
+func (Deployer) ProviderID() string {
+	return ID
+}
+
+func (Deployer) Deploy(ctx context.Context) error {
+	cfg, err := awsconfig.LoadDefaultConfig(ctx)
+	if err != nil {
+		return fmt.Errorf("load AWS config: %w", err)
+	}
+
+	regions, err := ListRegions(ctx, cfg)
+	if err != nil {
+		return err
+	}
+
+	region, err := SelectRegion(regions)
+	if err != nil {
+		return fmt.Errorf("select region: %w", err)
+	}
+
+	imageID, err := latestUbuntuAMI(ctx, cfg, region)
+	if err != nil {
+		return err
+	}
+
+	instance, err := createInstance(ctx, cfg, region, imageID)
+	if err != nil {
+		return err
+	}
+
+	fmt.Printf("Launched instance %s (%s) in %s\n",
+		aws.ToString(instance.InstanceId),
+		aws.ToString(instance.PublicIpAddress),
+		region,
+	)
+
+	return nil
+}
+
+// latestUbuntuAMI looks up the current Ubuntu 24.04 LTS AMI for the given
+// region via AWS's public SSM parameter, so the deploy works in any region.
+func latestUbuntuAMI(ctx context.Context, cfg aws.Config, region string) (string, error) {
+	client := ssm.NewFromConfig(cfg, func(o *ssm.Options) {
+		o.Region = region
+	})
+
+	param, err := client.GetParameter(ctx, &ssm.GetParameterInput{
+		Name: aws.String("/aws/service/canonical/ubuntu/server/24.04/stable/current/amd64/hvm/ebs-gp3/ami-id"),
+	})
+	if err != nil {
+		return "", fmt.Errorf("look up Ubuntu AMI for %s: %w", region, err)
+	}
+
+	return aws.ToString(param.Parameter.Value), nil
+}
+
+// createInstance launches a single t2.micro EC2 instance in the given region.
+func createInstance(ctx context.Context, cfg aws.Config, region, imageID string) (*types.Instance, error) {
+	client := ec2.NewFromConfig(cfg, func(o *ec2.Options) {
+		o.Region = region
+	})
+
+	output, err := client.RunInstances(ctx, &ec2.RunInstancesInput{
+		ImageId:      aws.String(imageID),
+		InstanceType: ec2.InstanceTypeT2Micro,
+		MinCount:     aws.Int32(1),
+		MaxCount:     aws.Int32(1),
+		TagSpecifications: []types.TagSpecification{
+			{
+				ResourceType: types.ResourceTypeInstance,
+				Tags: []types.Tag{
+					{Key: aws.String("Name"), Value: aws.String("wiregam")},
+				},
+			},
+		},
+	})
+	if err != nil {
+		return nil, fmt.Errorf("run EC2 instance in %s: %w", region, err)
+	}
+
+	return &output.Instances[0], nil
+}
+
+func ListRegions(ctx context.Context, cfg aws.Config) ([]string, error) {
+	client := ec2.NewFromConfig(cfg)
+
+	result, err := client.DescribeRegions(ctx, &ec2.DescribeRegionsInput{})
+	if err != nil {
+		return nil, fmt.Errorf("list AWS regions: %w", err)
+	}
+
+	regions := make([]string, 0, len(result.Regions))
+	for _, region := range  result.Regions {
+		if region.RegionName != nil {
+			regions = append(regions, *region.RegionName)
+		}
+	}
+
+	return regions, nil
+}
+
+func SelectRegion(regions []string) (string, error) {
+	var selected string
+
+	prompt := &survey.Select{
+		Message: "Select AWS region:",
+		Options: regions,
+	}
+
+	if err := survey.AskOne(prompt, &selected); err != nil {
+		return "", err
+	}
+
+	return selected, nil
+}
+ 

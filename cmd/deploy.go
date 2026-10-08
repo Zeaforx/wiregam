@@ -4,10 +4,16 @@ Copyright © 2026 NAME HERE <EMAIL ADDRESS>
 package cmd
 
 import (
+	"context"
 	"fmt"
 
 	"github.com/spf13/cobra"
+
+	"github.com/zeaforx/wiregam/internal/deploy"
+	"github.com/zeaforx/wiregam/internal/providers"
 )
+
+var deployService = deploy.DefaultService()
 
 // deployCmd represents the deploy command
 var deployCmd = &cobra.Command{
@@ -19,15 +25,30 @@ and usage of using your command. For example:
 Cobra is a CLI library for Go that empowers applications.
 This application is a tool to generate the needed files
 to quickly create a Cobra application.`,
-	Run: func(cmd *cobra.Command, args []string) {
-		fmt.Println("deploy called")
+	PreRunE: func(cmd *cobra.Command, args []string) error {
+		selectedProvider, found := providers.Find(provider)
+		if !found {
+			return fmt.Errorf("provider %q does not exist", provider)
+		}
+
+		if !selectedProvider.IsAvailable {
+			return fmt.Errorf("provider %q is not available yet", provider)
+		}
+
+		return nil
+	},
+	RunE: func(cmd *cobra.Command, args []string) error {
+		return deployService.Deploy(context.Background(), provider)
 	},
 }
 
 func init() {
 	rootCmd.AddCommand(deployCmd)
 
-	// deployCmd.Flags().StringVarP("")
+	deployCmd.Flags().StringVar(&provider, "provider", "", "Choose cloud provider for vpn")
+	if err := deployCmd.MarkFlagRequired("provider"); err != nil {
+		panic(err)
+	}
 
 	// Here you will define your flags and configuration settings.
 

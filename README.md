@@ -2,19 +2,28 @@
 
 > **Beta software — use at your own risk.** WireGam is still under active development. It creates and configures AWS resources in your account. Those resources can incur AWS charges, and this project does not yet clean them up automatically. Review all resources and billing in the AWS Console after every test deployment.
 
-WireGam is a command-line tool that provisions an AWS EC2 instance for a WireGuard VPN workflow and verifies Systems Manager (SSM) connectivity.
+WireGam is a command-line tool that provisions an AWS EC2 instance and connects a Fedora laptop to it through WireGuard in one deployment command.
 
 ## What the AWS deployment currently does
 
 For the AWS region you select, WireGam:
 
+- installs the local WireGuard and DNS helper packages when needed;
+- creates or reuses a laptop key pair under `~/.wiregam/wireguard/`;
 - finds the latest Amazon Linux 2023 x86_64 AMI;
 - finds or creates the `wiregam-sg` security group;
 - permits UDP port `51820` from the IP address detected on the machine running WireGam;
 - launches a `t3.micro` EC2 instance tagged `Name=wiregam` and `Project=wiregam-instance`;
 - attaches the existing instance profile named `wiregam-ec2-ssm-role`;
-- waits for the instance and its SSM agent; and
-- runs the embedded deployment scripts through SSM, starting with WireGuard installation.
+- disables source/destination checking so the instance can forward VPN traffic;
+- waits for the instance and its SSM agent;
+- runs embedded scripts that install, configure, start, and verify WireGuard on EC2;
+- writes `/etc/wireguard/wg0.conf` on the laptop; and
+- starts the laptop tunnel, verifies its first handshake, and enables it at boot.
+
+The laptop private key never leaves the laptop. Only its public key is sent to
+EC2. The EC2 private key likewise remains on EC2; the deploy command retrieves
+only its public key.
 
 The deployment scripts are embedded in the CLI under `internal/scripts/`. They
 run in the order listed by `scripts.Deployment()`; WireGam waits for each script
@@ -38,6 +47,7 @@ Do not commit, share, or paste the AWS credentials requested by the CLI.
 ## Prerequisites
 
 - Go **1.26.5** or later;
+- a Fedora Linux laptop with `sudo` access and the `dnf` package manager;
 - an AWS account;
 - an IAM access key for an IAM user or role with the permissions below;
 - an existing EC2 instance profile named `wiregam-ec2-ssm-role`; and
@@ -54,6 +64,10 @@ go build -o wiregam .
 ./wiregam auth --provider aws
 ./wiregam deploy --provider aws
 ```
+
+`deploy` may ask for the laptop's sudo password while installing local packages
+and writing `/etc/wireguard/wg0.conf`. When it returns successfully, `wg0` is up
+and all IPv4 traffic is routed through the new EC2 instance.
 
 `auth` prompts for an AWS access key and secret access key, validates them with STS, and stores them locally at:
 
@@ -88,6 +102,7 @@ Replace `ACCOUNT_ID` with your AWS account ID before attaching this policy to th
         "ec2:DescribeInstances",
         "ec2:CreateSecurityGroup",
         "ec2:AuthorizeSecurityGroupIngress",
+        "ec2:ModifyInstanceAttribute",
         "ec2:RunInstances",
         "ec2:CreateTags"
       ],

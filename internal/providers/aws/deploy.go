@@ -5,8 +5,9 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
-	"log"
+	"io"
 	"net"
+	"net/http"
 	"strings"
 	"time"
 
@@ -19,6 +20,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/ssm"
 	ssmtypes "github.com/aws/aws-sdk-go-v2/service/ssm/types"
 	"github.com/aws/smithy-go"
+	"github.com/zeaforx/wiregam/internal/localvpn"
 	"github.com/zeaforx/wiregam/internal/scripts"
 )
 
@@ -29,6 +31,14 @@ func (Deployer) ProviderID() string {
 }
 
 func (Deployer) Deploy(ctx context.Context) error {
+	// Prepare the laptop first so deployment fails before creating chargeable
+	// resources if WireGuard or local privilege escalation is unavailable.
+	clientKeys, err := localvpn.Prepare(ctx)
+	if err != nil {
+		return fmt.Errorf("prepare this laptop: %w", err)
+	}
+	fmt.Println("Local WireGuard keys are ready.")
+
 	// Load stored AWS credentials.
 	storedCredentials, err := LoadCredentials()
 	if err != nil {
@@ -47,6 +57,9 @@ func (Deployer) Deploy(ctx context.Context) error {
 	)
 	if err != nil {
 		return fmt.Errorf("load AWS config: %w", err)
+	}
+	if cfg.Region == "" {
+		cfg.Region = "us-east-1"
 	}
 
 	// 1. Select AWS region.
@@ -76,12 +89,12 @@ func (Deployer) Deploy(ctx context.Context) error {
 		return err
 	}
 
-	localIP, err := getOutboundIP()
+	localIP, err := getPublicIP(ctx)
 	if err != nil {
-		return fmt.Errorf("get outbound IP: %w", err)
+		return fmt.Errorf("get laptop public IP: %w", err)
 	}
 
-	log.Printf("Outbound IP: %s\n", localIP.String())
+	fmt.Printf("Laptop public IP: %s\n", localIP.String())
 
 	if err := customizeSecurityGroupPorts(ctx, ec2.NewFromConfig(cfg), securityGroupID, localIP); err != nil {
 		return fmt.Errorf("customize security group ports: %w", err)
@@ -98,16 +111,62 @@ func (Deployer) Deploy(ctx context.Context) error {
 		return err
 	}
 
-	// 5. Wait for the SSM agent to register.
+	// 5. Allow the instance to forward traffic for WireGuard clients.
+	if err := DisableSourceDestinationCheck(ctx, cfg, instanceID); err != nil {
+		return err
+	}
+
+	// 6. Wait for the SSM agent to register.
 	if err := WaitForSSM(ctx, cfg, instanceID); err != nil {
 		return err
 	}
 
-	// 6. Configure the instance using the ordered deployment scripts.
-	if err := RunDeploymentScripts(ctx, cfg, instanceID, scripts.Deployment()); err != nil {
+	// 7. Configure the instance using the ordered deployment scripts. Only the
+	// laptop public key is sent to EC2.
+	deploymentScripts, err := scripts.Deployment(clientKeys.PublicKey)
+	if err != nil {
+		return fmt.Errorf("prepare EC2 deployment scripts: %w", err)
+	}
+	outputs, err := RunDeploymentScripts(ctx, cfg, instanceID, deploymentScripts)
+	if err != nil {
 		return err
 	}
 
+	serverPublicKey, err := serverPublicKeyFromOutput(outputs["start-wireguard"])
+	if err != nil {
+		return err
+	}
+	serverPublicIP, err := GetInstancePublicIPv4(ctx, cfg, instanceID)
+	if err != nil {
+		return err
+	}
+
+	// 8. Complete the laptop configuration and connect only after all AWS work
+	// has finished, since the default route changes when wg0 starts.
+	if err := localvpn.ConfigureAndStart(ctx, clientKeys, serverPublicKey, serverPublicIP); err != nil {
+		return fmt.Errorf("configure this laptop: %w", err)
+	}
+
+	fmt.Printf("VPN deployment complete. Traffic is now routed through %s.\n", serverPublicIP)
+
+	return nil
+}
+
+// DisableSourceDestinationCheck permits the instance to route traffic between
+// WireGuard clients and the internet.
+func DisableSourceDestinationCheck(ctx context.Context, cfg aws.Config, instanceID string) error {
+	client := ec2.NewFromConfig(cfg)
+	_, err := client.ModifyInstanceAttribute(ctx, &ec2.ModifyInstanceAttributeInput{
+		InstanceId: aws.String(instanceID),
+		SourceDestCheck: &ec2types.AttributeBooleanValue{
+			Value: aws.Bool(false),
+		},
+	})
+	if err != nil {
+		return fmt.Errorf("disable source/destination check for %s: %w", instanceID, err)
+	}
+
+	fmt.Println("Disabled source/destination check for", instanceID)
 	return nil
 }
 
@@ -251,12 +310,6 @@ func CreateInstance(
 ) (string, error) {
 
 	client := ec2.NewFromConfig(cfg)
-	localIP, err := getOutboundIP()
-	if err != nil {
-		return "", fmt.Errorf("get outbound IP: %w", err)
-	}
-
-	log.Printf("Outbound IP: %s\n", localIP.String())
 
 	input := &ec2.RunInstancesInput{
 		ImageId:          aws.String(imageID),
@@ -418,24 +471,27 @@ func RunDeploymentScripts(
 	cfg aws.Config,
 	instanceID string,
 	deploymentScripts []scripts.Script,
-) error {
+) (map[string]string, error) {
 	client := ssm.NewFromConfig(cfg)
+	outputs := make(map[string]string, len(deploymentScripts))
 
 	for _, script := range deploymentScripts {
 		if strings.TrimSpace(script.Name) == "" {
-			return errors.New("deployment script has an empty name")
+			return nil, errors.New("deployment script has an empty name")
 		}
 
 		if strings.TrimSpace(script.Contents) == "" {
-			return fmt.Errorf("deployment script %q is empty", script.Name)
+			return nil, fmt.Errorf("deployment script %q is empty", script.Name)
 		}
 
-		if err := runSSMScript(ctx, client, instanceID, script); err != nil {
-			return err
+		stdout, err := runSSMScript(ctx, client, instanceID, script)
+		if err != nil {
+			return nil, err
 		}
+		outputs[script.Name] = stdout
 	}
 
-	return nil
+	return outputs, nil
 }
 
 func runSSMScript(
@@ -443,7 +499,7 @@ func runSSMScript(
 	client *ssm.Client,
 	instanceID string,
 	script scripts.Script,
-) error {
+) (string, error) {
 	fmt.Printf("Running %s on %s through SSM...\n", script.Name, instanceID)
 
 	output, err := client.SendCommand(
@@ -463,21 +519,21 @@ func runSSMScript(
 	)
 
 	if err != nil {
-		return fmt.Errorf("send %s through SSM: %w", script.Name, err)
+		return "", fmt.Errorf("send %s through SSM: %w", script.Name, err)
 	}
 
 	if output.Command == nil {
-		return fmt.Errorf("SSM returned no command information for %s", script.Name)
+		return "", fmt.Errorf("SSM returned no command information for %s", script.Name)
 	}
 
 	commandID := aws.ToString(output.Command.CommandId)
 	if commandID == "" {
-		return fmt.Errorf("SSM returned an empty command ID for %s", script.Name)
+		return "", fmt.Errorf("SSM returned an empty command ID for %s", script.Name)
 	}
 
 	invocation, err := waitForCommand(ctx, client, commandID, instanceID)
 	if err != nil {
-		return fmt.Errorf("wait for %s: %w", script.Name, err)
+		return "", fmt.Errorf("wait for %s: %w", script.Name, err)
 	}
 
 	stdout := strings.TrimSpace(aws.ToString(invocation.StandardOutputContent))
@@ -485,7 +541,7 @@ func runSSMScript(
 	status := invocation.Status
 
 	if status != ssmtypes.CommandInvocationStatusSuccess {
-		return fmt.Errorf(
+		return "", fmt.Errorf(
 			"script %s failed with SSM status %s\nstdout:\n%s\nstderr:\n%s",
 			script.Name,
 			status,
@@ -499,7 +555,7 @@ func runSSMScript(
 		fmt.Printf("%s\n", stdout)
 	}
 
-	return nil
+	return stdout, nil
 }
 
 func encodeShellScript(contents string) string {
@@ -596,13 +652,6 @@ func CreateSecurityGroup(
 }
 
 func customizeSecurityGroupPorts(ctx context.Context, client *ec2.Client, securityGroupID string, localIP net.IP) error {
-
-	// localIP, err := getOutboundIP()
-	// if err != nil {
-	// 	return fmt.Errorf("get outbound IP: %w", err)
-	// }
-
-	// log.Printf("Outbound IP: %s\n", localIP.String())
 	_, err := client.AuthorizeSecurityGroupIngress(
 		ctx,
 		&ec2.AuthorizeSecurityGroupIngressInput{
@@ -629,21 +678,70 @@ func customizeSecurityGroupPorts(ctx context.Context, client *ec2.Client, securi
 		return nil
 	}
 
-	return fmt.Errorf("allow UDP port 51820: %w", err)
-	// if err != nil {
-	// 	return fmt.Errorf("allow UDP port 51820: %w", err)
-	// }
+	if err != nil {
+		return fmt.Errorf("allow UDP port 51820: %w", err)
+	}
+
 	return nil
 }
 
-func getOutboundIP() (net.IP, error) {
-	// 8.8.8.8:80 is a dummy address (Google DNS). No connection is actually made.
-	conn, err := net.Dial("udp", "8.8.8.8:80")
+func GetInstancePublicIPv4(ctx context.Context, cfg aws.Config, instanceID string) (string, error) {
+	result, err := ec2.NewFromConfig(cfg).DescribeInstances(ctx, &ec2.DescribeInstancesInput{
+		InstanceIds: []string{instanceID},
+	})
+	if err != nil {
+		return "", fmt.Errorf("describe EC2 instance %s: %w", instanceID, err)
+	}
+	for _, reservation := range result.Reservations {
+		for _, instance := range reservation.Instances {
+			publicIP := aws.ToString(instance.PublicIpAddress)
+			parsed := net.ParseIP(publicIP)
+			if parsed != nil && parsed.To4() != nil {
+				return parsed.String(), nil
+			}
+		}
+	}
+	return "", fmt.Errorf("EC2 instance %s has no public IPv4 address", instanceID)
+}
+
+func serverPublicKeyFromOutput(output string) (string, error) {
+	const prefix = "WIREGAM_SERVER_PUBLIC_KEY="
+	for _, line := range strings.Split(output, "\n") {
+		if !strings.HasPrefix(line, prefix) {
+			continue
+		}
+		key := strings.TrimPrefix(line, prefix)
+		decoded, err := base64.StdEncoding.DecodeString(key)
+		if err == nil && len(decoded) == 32 {
+			return key, nil
+		}
+		return "", fmt.Errorf("EC2 returned an invalid WireGuard server public key")
+	}
+	return "", fmt.Errorf("EC2 did not return its WireGuard server public key")
+}
+
+func getPublicIP(ctx context.Context) (net.IP, error) {
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, "https://checkip.amazonaws.com", nil)
 	if err != nil {
 		return nil, err
 	}
-	defer conn.Close()
+	response, err := (&http.Client{Timeout: 10 * time.Second}).Do(request)
+	if err != nil {
+		return nil, err
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("public IP service returned %s", response.Status)
+	}
 
-	localAddr := conn.LocalAddr().(*net.UDPAddr)
-	return localAddr.IP, nil
+	body, err := io.ReadAll(io.LimitReader(response.Body, 64))
+	if err != nil {
+		return nil, err
+	}
+	address := net.ParseIP(strings.TrimSpace(string(body)))
+	if address == nil || address.To4() == nil {
+		return nil, fmt.Errorf("public IP service returned an invalid IPv4 address")
+	}
+
+	return address.To4(), nil
 }

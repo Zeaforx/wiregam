@@ -341,3 +341,25 @@ func waitForHandshake(ctx context.Context, timeout time.Duration) error {
 		}
 	}
 }
+
+func Disconnect(ctx context.Context) error {
+	if err := runInteractive(ctx, "sudo", "wg-quick", "down", "wg0"); err != nil {
+		return fmt.Errorf("stop WireGuard tunnel: %w", err)
+	}
+	if err := runInteractive(ctx, "sudo", "systemctl", "disable", "wg-quick@wg0"); err != nil {
+		return fmt.Errorf("disable WireGuard at boot: %w", err)
+	}
+	fmt.Println("WireGuard tunnel is disconnected.")
+	return nil
+}
+
+func Connect(ctx context.Context) error {
+	if err := runInteractive(ctx, "sudo", "wg-quick", "up", "wg0"); err != nil {
+		return fmt.Errorf("start WireGuard tunnel: %w", err)
+	}
+	if err := runInteractive(ctx, "sudo", "systemctl", "enable", "wg-quick@wg0"); err != nil {
+		return fmt.Errorf("enable WireGuard at boot: %w", err)
+	}
+	fmt.Println("WireGuard tunnel is connected.")
+	return nil
+}

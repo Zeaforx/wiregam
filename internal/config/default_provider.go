@@ -34,3 +34,23 @@ func StoreDefaultProvider(provider string) error {
 
 	return nil
 }
+
+func LoadDefaultProvider() (string, error) {
+	homeDir, err := os.UserHomeDir()
+	if err != nil {
+		return "", fmt.Errorf("get home directory: %w", err)
+	}
+
+	configPath := filepath.Join(homeDir, ".wiregam", "config.json")
+	data, err := os.ReadFile(configPath)
+	if err != nil {
+		return "", fmt.Errorf("read config file: %w", err)
+	}
+
+	var cfg Config
+	if err := json.Unmarshal(data, &cfg); err != nil {
+		return "", fmt.Errorf("decode config: %w", err)
+	}
+
+	return cfg.DefaultProvider, nil
+}

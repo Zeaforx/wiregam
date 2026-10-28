@@ -1,6 +1,6 @@
 # WireGam
 
-> **Beta software — use at your own risk.** WireGam is still under active development. It creates and configures AWS resources in your account. Those resources can incur AWS charges, and this project does not yet clean them up automatically. Review all resources and billing in the AWS Console after every test deployment.
+> **Beta software — use at your own risk.** WireGam is still under active development. It creates and configures AWS resources in your account. Those resources can incur AWS charges. The destroy command terminates matching WireGam EC2 instances, but you should still review all resources and billing in the AWS Console after every test deployment.
 
 WireGam is a command-line tool that provisions an AWS EC2 instance and connects a Fedora laptop to it through WireGuard in one deployment command.
 
@@ -63,6 +63,7 @@ Clone the repository, then build and run the CLI:
 go build -o wiregam .
 ./wiregam auth --provider aws
 ./wiregam deploy --provider aws
+./wiregam destroy --provider aws
 ```
 
 `deploy` may ask for the laptop's sudo password while installing local packages
@@ -82,6 +83,7 @@ You can also run the commands without building a binary:
 ```bash
 go run . auth --provider aws
 go run . deploy --provider aws
+go run . destroy --provider aws
 ```
 
 ## IAM permissions for the WireGam credentials
@@ -107,6 +109,17 @@ Replace `ACCOUNT_ID` with your AWS account ID before attaching this policy to th
         "ec2:CreateTags"
       ],
       "Resource": "*"
+    },
+    {
+      "Sid": "AllowTerminateWireGamInstances",
+      "Effect": "Allow",
+      "Action": "ec2:TerminateInstances",
+      "Resource": "arn:aws:ec2:*:ACCOUNT_ID:instance/*",
+      "Condition": {
+        "StringEquals": {
+          "ec2:ResourceTag/Project": "wiregam-instance"
+        }
+      }
     },
     {
       "Sid": "AllowWireGamSSMDocument",
@@ -171,7 +184,7 @@ Check all of the following:
 
 ## Cleanup
 
-When finished, manually terminate the EC2 instances tagged `Project=wiregam-instance`. Review and delete the `wiregam-sg` security group only after no instances or network interfaces use it. Also review EBS volumes, elastic IPs, snapshots, and other related resources in the AWS Console.
+When finished, run `wiregam destroy --provider aws`, select the deployment region, review the matching instance IDs, and confirm termination. If the local `wg0` tunnel is active, WireGam disconnects it before terminating instances. The command only terminates non-terminated EC2 instances tagged `Project=wiregam-instance`. Review and delete the `wiregam-sg` security group only after no instances or network interfaces use it. Also review EBS volumes, elastic IPs, snapshots, and other related resources in the AWS Console.
 
 ## Beta status
 

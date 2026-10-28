@@ -353,6 +353,20 @@ func Disconnect(ctx context.Context) error {
 	return nil
 }
 
+// DisconnectIfActive stops the WireGuard tunnel only when wg0 exists. It
+// returns whether a tunnel was disconnected.
+func DisconnectIfActive(ctx context.Context) (bool, error) {
+	if !interfaceExists(ctx, "wg0") {
+		return false, nil
+	}
+
+	if err := Disconnect(ctx); err != nil {
+		return true, err
+	}
+
+	return true, nil
+}
+
 func Connect(ctx context.Context) error {
 	if err := runInteractive(ctx, "sudo", "wg-quick", "up", "wg0"); err != nil {
 		return fmt.Errorf("start WireGuard tunnel: %w", err)
